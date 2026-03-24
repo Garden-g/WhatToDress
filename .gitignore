@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+.env
+*.log
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+data/images/original/*
+data/images/white_bg/*
+data/logs/*.log
+!data/images/original/.gitkeep
+!data/images/white_bg/.gitkeep
+!data/logs/.gitkeep
