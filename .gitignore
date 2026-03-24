@@ -9,6 +9,7 @@ __pycache__/
 *.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+Plan.md
 data/images/original/*
 data/images/white_bg/*
 data/logs/*.log
