@@ -1,7 +1,7 @@
 import type {
   ApiEnvelope,
   ChatMessage,
-  ChatResponseData,
+  ChatStreamCallbacks,
   ForgottenItem,
   OutfitRecommendation,
   UploadDraftItem,
@@ -144,14 +144,104 @@ export const api = {
     });
   },
 
-  chat(message: string, history: ChatMessage[]) {
-    return request<ChatResponseData>("/api/chat", {
+  /**
+   * SSE 流式对话接口 —— 通过回调逐步推送事件
+   *
+   * 后端返回 SSE 流，事件类型包括：
+   *   stage      → 当前阶段 (planning/executing/summarizing)
+   *   thinking   → 思维链 chunk
+   *   tool_calls → 工具调用信息
+   *   tool_status→ 工具执行状态
+   *   reply      → 最终回复文本
+   *   cards      → 卡片数据 + action
+   *   done       → 结束
+   *   error      → 错误
+   */
+  async chatStream(
+    message: string,
+    history: ChatMessage[],
+    callbacks: ChatStreamCallbacks
+  ): Promise<void> {
+    const response = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
         history: history.map(({ role, content }) => ({ role, content }))
       })
     });
+
+    if (!response.ok || !response.body) {
+      const text = await response.text();
+      callbacks.onError?.(buildRequestErrorMessage(response.status, text));
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    // 逐行解析 SSE
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      // 最后一个元素可能是不完整的行，保留在 buffer 中
+      buffer = lines.pop() ?? "";
+
+      let currentEvent = "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          currentEvent = line.slice(7).trim();
+        } else if (line.startsWith("data: ") && currentEvent) {
+          try {
+            const data = JSON.parse(line.slice(6)) as Record<string, unknown>;
+            this._dispatchSSE(currentEvent, data, callbacks);
+          } catch {
+            // 忽略无法解析的行
+          }
+          currentEvent = "";
+        } else if (line.trim() === "") {
+          currentEvent = "";
+        }
+      }
+    }
+  },
+
+  /** 内部方法：根据 SSE 事件类型分发回调 */
+  _dispatchSSE(
+    eventType: string,
+    data: Record<string, unknown>,
+    cb: ChatStreamCallbacks
+  ) {
+    switch (eventType) {
+      case "stage":
+        cb.onStage?.(data.phase as string);
+        break;
+      case "thinking":
+        cb.onThinking?.(data.text as string, data.phase as string);
+        break;
+      case "tool_calls":
+        cb.onToolCalls?.(data.tools as Array<{ name: string; arguments: Record<string, unknown> }>);
+        break;
+      case "tool_status":
+        cb.onToolStatus?.(data.name as string, data.status as string);
+        break;
+      case "reply":
+        cb.onReply?.(data.text as string);
+        break;
+      case "cards":
+        cb.onCards?.(data.cards as Array<Record<string, unknown>>, data.action as string);
+        break;
+      case "done":
+        cb.onDone?.();
+        break;
+      case "error":
+        cb.onError?.(data.message as string);
+        break;
+    }
   },
 
   getRecommendations(scenario: string, weatherMessage: string) {

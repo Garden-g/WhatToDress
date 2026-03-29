@@ -43,9 +43,19 @@ def build_agent_node(
                     "reply": "我先没完全听明白。你可以直接说“我有什么蓝色衬衫”或“明天 18 度通勤穿什么”。",
                     "cards": [],
                     "action": "clarify",
+                    "planning_thinking": "",
+                    "summarize_thinking": "",
+                    "tool_calls_info": [],
                 }
 
+            # 提取 R1 思维链和工具调用摘要
+            planning_thinking = plan.pop("_thinking", "")
             tool_calls = plan.get("tool_calls") or []
+            tool_calls_info = [
+                {"name": tc.get("name", ""), "arguments": tc.get("arguments", {})}
+                for tc in tool_calls
+            ]
+
             if not tool_calls:
                 return {
                     **state,
@@ -53,8 +63,16 @@ def build_agent_node(
                     "reply": plan.get("direct_reply") or "我这边先需要你补充一点信息。",
                     "cards": [],
                     "action": plan.get("action") or "clarify",
+                    "planning_thinking": planning_thinking,
+                    "summarize_thinking": "",
+                    "tool_calls_info": tool_calls_info,
                 }
-            return {**state, "plan": plan}
+            return {
+                **state,
+                "plan": plan,
+                "planning_thinking": planning_thinking,
+                "tool_calls_info": tool_calls_info,
+            }
 
         logger.info("agent_node summarizing")
         try:
@@ -68,6 +86,7 @@ def build_agent_node(
                 "reply": summary.get("reply", "我已经帮你整理好了结果。"),
                 "cards": summary.get("cards", []),
                 "action": summary.get("action", state.get("plan", {}).get("action", "query")),
+                "summarize_thinking": summary.get("_thinking", ""),
             }
         except Exception as error:
             logger.warning("DeepSeek summarize failed, fallback local summary: %s", error)
@@ -82,6 +101,7 @@ def build_agent_node(
                 "reply": "我已经根据当前数据整理好了，你可以先看下面的卡片结果。",
                 "cards": cards,
                 "action": state.get("plan", {}).get("action", "query"),
+                "summarize_thinking": "",
             }
 
     return agent_node

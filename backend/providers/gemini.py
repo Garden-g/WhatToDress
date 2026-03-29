@@ -94,6 +94,9 @@ class GeminiProvider:
             ValueError: 当 Gemini 调用失败、返回为空或返回非 JSON 时抛出。
         """
 
+        from backend.models.taxonomy import build_taxonomy_description
+
+        taxonomy_desc = build_taxonomy_description()
         prompt = (
             "请分析这是一件什么衣物，并只返回 JSON。"
             "字段固定为：category, subcategory, closet_section, color, secondary_color, "
@@ -101,6 +104,11 @@ class GeminiProvider:
             "closet_section 只能取 top/bottom/outerwear/shoes/accessory/other。"
             "formality 只能取 casual/smart_casual/formal。"
             "season_tags 与 style_tags 必须是数组。"
+            "\n\n重要：所有字段值必须使用中文（closet_section 和 formality 除外）。"
+            "\n" + taxonomy_desc + "\n"
+            "color 和 secondary_color 请用中文颜色名（如 黑色、白色、深蓝色）。"
+            "material 请用中文材质名（如 皮革、棉、牛仔布）。"
+            "style_tags 请用中文风格标签（如 休闲、街头、复古、优雅）。"
         )
 
         self.logger.info(

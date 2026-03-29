@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.responses import FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 
 from backend.agent.graph import build_agent_graph
 from backend.agent.nodes import build_agent_node, build_tool_executor_node
@@ -17,7 +17,6 @@ from backend.config import Settings
 from backend.models.api import (
     ApiEnvelope,
     ChatRequest,
-    ChatResponseData,
     ConfirmWardrobeRequest,
     ForgottenItemResponse,
     ForgottenListResponse,
@@ -101,17 +100,17 @@ class ApplicationContext:
         self.recommend_service = RecommendToolService(self.deepseek_provider)
         self.outfit_store = outfit_store
 
-        tool_schemas = self._build_tool_schemas()
-        tool_registry = self._build_tool_registry()
+        self.tool_schemas = self._build_tool_schemas()
+        self.tool_registry = self._build_tool_registry()
 
         self.agent_graph = build_agent_graph(
             agent_node=build_agent_node(
                 provider=self.deepseek_provider,
-                tool_schemas=tool_schemas,
+                tool_schemas=self.tool_schemas,
                 context_builder=self._build_context_snapshot,
                 logger=logger,
             ),
-            tool_executor_node=build_tool_executor_node(tool_registry=tool_registry, logger=logger),
+            tool_executor_node=build_tool_executor_node(tool_registry=self.tool_registry, logger=logger),
         )
 
     def _build_context_snapshot(self) -> dict[str, Any]:
@@ -423,19 +422,120 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return success(PreferenceResponse(preference=preference).model_dump(mode="json"))
 
     @app.post("/api/chat")
-    def chat(payload: ChatRequest) -> ApiEnvelope:
-        result = context.agent_graph.invoke(
-            {
-                "user_message": payload.message,
-                "chat_history": [message.model_dump(mode="json") for message in payload.history],
-            }
+    async def chat(payload: ChatRequest) -> StreamingResponse:
+        """SSE 流式对话端点。
+
+        不再走 LangGraph.invoke()，而是手动编排节点以支持流式推送：
+          1. stage(planning)  → 流式推送思维链
+          2. tool_calls       → 推送工具调用信息
+          3. tool_status      → 逐工具推送执行状态
+          4. stage(summarizing) → 流式推送思维链
+          5. reply + cards    → 推送最终回复
+          6. done             → 结束
+
+        SSE 事件格式：event: {type}\ndata: {json}\n\n
+        """
+
+        async def event_generator():
+            """SSE 事件生成器，手动编排对话全流程。"""
+
+            def sse(event_type: str, data: Any) -> str:
+                """格式化一条 SSE 事件。"""
+                return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+            try:
+                # ── 阶段 1：规划（流式推送思维链） ──
+                yield sse("stage", {"phase": "planning"})
+
+                plan: dict[str, Any] = {}
+                async for event in context.deepseek_provider.async_stream_plan(
+                    user_message=payload.message,
+                    chat_history=[msg.model_dump(mode="json") for msg in payload.history],
+                    tool_schemas=context.tool_schemas,
+                    context_snapshot=context._build_context_snapshot(),
+                ):
+                    if event["type"] == "reasoning":
+                        yield sse("thinking", {"text": event["text"], "phase": "planning"})
+                    elif event["type"] == "plan":
+                        plan = event["plan"]
+
+                tool_calls = plan.get("tool_calls") or []
+                tool_calls_info = [
+                    {"name": tc.get("name", ""), "arguments": tc.get("arguments", {})}
+                    for tc in tool_calls
+                ]
+
+                # 如果没有工具调用（直接回复 or clarify）
+                if not tool_calls:
+                    yield sse("reply", {"text": plan.get("direct_reply", "需要你补充更多信息。")})
+                    yield sse("cards", {"cards": [], "action": plan.get("action", "clarify")})
+                    yield sse("done", {})
+                    return
+
+                # 推送工具调用信息
+                yield sse("tool_calls", {"tools": tool_calls_info})
+
+                # ── 阶段 2：执行工具 ──
+                yield sse("stage", {"phase": "executing"})
+                tool_results: list[dict[str, Any]] = []
+
+                for tc in tool_calls:
+                    name = tc.get("name", "")
+                    arguments = tc.get("arguments") or {}
+                    tool_fn = context.tool_registry.get(name)
+
+                    yield sse("tool_status", {"name": name, "status": "running"})
+
+                    if not tool_fn:
+                        logger.warning("Tool not found: %s", name)
+                        tool_results.append({"tool": name, "error": "tool not found"})
+                        yield sse("tool_status", {"name": name, "status": "error"})
+                        continue
+
+                    try:
+                        result = tool_fn(**arguments)
+                        tool_results.append({"tool": name, "result": result})
+                        yield sse("tool_status", {"name": name, "status": "done"})
+                    except Exception as tool_error:
+                        logger.warning("Tool %s failed: %s", name, tool_error)
+                        tool_results.append({"tool": name, "error": str(tool_error)})
+                        yield sse("tool_status", {"name": name, "status": "error"})
+
+                # ── 阶段 3：总结（流式推送思维链） ──
+                yield sse("stage", {"phase": "summarizing"})
+
+                summary: dict[str, Any] = {}
+                async for event in context.deepseek_provider.async_stream_summarize(
+                    user_message=payload.message,
+                    plan=plan,
+                    tool_results=tool_results,
+                ):
+                    if event["type"] == "reasoning":
+                        yield sse("thinking", {"text": event["text"], "phase": "summarizing"})
+                    elif event["type"] == "summary":
+                        summary = event["summary"]
+
+                # 推送最终回复和卡片
+                yield sse("reply", {"text": summary.get("reply", "整理好了，请看结果。")})
+                yield sse("cards", {
+                    "cards": summary.get("cards", []),
+                    "action": summary.get("action", plan.get("action", "query")),
+                })
+                yield sse("done", {})
+
+            except Exception as e:
+                logger.error("SSE chat error: %s", e, exc_info=True)
+                yield sse("error", {"message": str(e)})
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
         )
-        data = ChatResponseData(
-            reply=result.get("reply", "我已经处理好了。"),
-            cards=result.get("cards", []),
-            action=result.get("action", "query"),
-        )
-        return success(data.model_dump(mode="json"))
 
     @app.get("/api/images/{image_type}/{filename}")
     def get_image(image_type: str, filename: str):

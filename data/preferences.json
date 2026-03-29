@@ -1,0 +1,12 @@
+{
+  "user_id": "default-user",
+  "preferred_styles": [],
+  "avoid_styles": [],
+  "preferred_colors": [],
+  "avoid_colors": [],
+  "temperature_sensitivity": "normal",
+  "fit_preference": "不限",
+  "comfort_priority": "中",
+  "formality_preference": "smart_casual",
+  "updated_at": "2026-03-23T00:00:00+00:00"
+}

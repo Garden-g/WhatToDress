@@ -49,13 +49,21 @@ class GlmProvider:
         if not self.settings.glm_api_key:
             raise ValueError("GLM_API_KEY 未配置，无法使用 GLM-4.6V 识图")
 
+        from backend.models.taxonomy import build_taxonomy_description
+
         self.logger.info("Calling GLM vision analyze_image image=%s", image_path)
+        taxonomy_desc = build_taxonomy_description()
         prompt = (
             "请分析这是一件什么衣物，并只返回 JSON。"
             "字段固定为：category, subcategory, closet_section, color, secondary_color, "
             "season_tags, style_tags, formality, material, analysis_notes。"
             "closet_section 只能取 top/bottom/outerwear/shoes/accessory/other。"
             "season_tags 与 style_tags 必须是数组。"
+            "\n\n重要：所有字段值必须使用中文（closet_section 和 formality 除外）。"
+            "\n" + taxonomy_desc + "\n"
+            "color 和 secondary_color 请用中文颜色名（如 黑色、白色、深蓝色）。"
+            "material 请用中文材质名（如 皮革、棉、牛仔布）。"
+            "style_tags 请用中文风格标签（如 休闲、街头、复古、优雅）。"
         )
         payload = {
             "model": self.settings.glm_vision_model,

@@ -90,12 +90,37 @@ export interface ChatMessage {
   content: string;
   cards?: Array<Record<string, unknown>>;
   action?: "query" | "recommend" | "clarify" | "confirm";
+  /** DeepSeek-R1 思维链文本（可折叠展示） */
+  thinking?: string;
+  /** 本次调用了哪些工具及参数摘要 */
+  toolCallsInfo?: Array<{ name: string; arguments: Record<string, unknown> }>;
+  /** 工具执行状态（流式更新） */
+  toolStatuses?: Record<string, "running" | "done" | "error">;
+  /** 当前流式阶段 */
+  streamPhase?: "planning" | "executing" | "summarizing" | "done";
+}
+
+/** SSE 事件类型定义（后端推送的 event type） */
+export type SSEEventType = "stage" | "thinking" | "tool_calls" | "tool_status" | "reply" | "cards" | "done" | "error";
+
+/** SSE 事件回调接口 */
+export interface ChatStreamCallbacks {
+  onStage?: (phase: string) => void;
+  onThinking?: (text: string, phase: string) => void;
+  onToolCalls?: (tools: Array<{ name: string; arguments: Record<string, unknown> }>) => void;
+  onToolStatus?: (name: string, status: string) => void;
+  onReply?: (text: string) => void;
+  onCards?: (cards: Array<Record<string, unknown>>, action: string) => void;
+  onDone?: () => void;
+  onError?: (message: string) => void;
 }
 
 export interface ChatResponseData {
   reply: string;
   cards: Array<Record<string, unknown>>;
   action: "query" | "recommend" | "clarify" | "confirm";
+  thinking?: string | null;
+  tool_calls_info?: Array<{ name: string; arguments: Record<string, unknown> }> | null;
 }
 
 export interface UploadDraftItem {

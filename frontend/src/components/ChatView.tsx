@@ -1,9 +1,50 @@
-import { Loader2, SendHorizontal } from "lucide-react";
-import { useState } from "react";
+import { ChevronDown, ChevronRight, Loader2, SendHorizontal } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../api/client";
-import type { ChatMessage, OutfitRecommendation, WardrobeItem, WeatherSnapshot } from "../types";
+import type { ChatMessage, ChatStreamCallbacks, OutfitRecommendation, WardrobeItem, WeatherSnapshot } from "../types";
 import { ItemCard } from "./ItemCard";
+
+/**
+ * 可折叠面板组件 —— 用于包裹「思考过程」或「工具调用」等区块
+ * @param title       标题文字（始终可见）
+ * @param children    折叠/展开的内容
+ * @param defaultOpen 是否默认展开，默认 false
+ */
+function Collapsible({ title, children, defaultOpen = false }: {
+  title: ReactNode;
+  children: ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1 text-xs text-[color:var(--muted)] hover:text-[color:var(--ink)] transition-colors"
+      >
+        {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+        {title}
+      </button>
+      {open && <div className="mt-1.5 ml-4">{children}</div>}
+    </div>
+  );
+}
+
+/** 阶段描述映射 */
+const PHASE_LABELS: Record<string, string> = {
+  planning: "正在思考...",
+  executing: "正在查询...",
+  summarizing: "正在整理...",
+};
+
+/** 工具执行状态图标 */
+const TOOL_STATUS_ICON: Record<string, string> = {
+  running: "⏳",
+  done: "✅",
+  error: "❌",
+};
 
 interface ChatViewProps {
   onAccepted: (outfit: OutfitRecommendation, weather: WeatherSnapshot | null, scenario: string) => Promise<void>;
@@ -37,40 +78,120 @@ export function ChatView({ onAccepted }: ChatViewProps) {
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
 
-  async function handleSend() {
-    if (!input.trim()) {
-      return;
-    }
+  // 用于自动滚动到底部
+  const chatEndRef = useRef<HTMLDivElement>(null);
 
-    const nextUserMessage: ChatMessage = { role: "user", content: input.trim() };
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isSending]);
+
+  /**
+   * 更新「最后一条助手消息」的某些字段。
+   * 在 SSE 流式过程中会被频繁调用来追加 thinking、更新状态等。
+   */
+  const updateLastAssistant = useCallback(
+    (updater: (prev: ChatMessage) => Partial<ChatMessage>) => {
+      setMessages((current) => {
+        const copy = [...current];
+        const lastIdx = copy.length - 1;
+        if (lastIdx >= 0 && copy[lastIdx].role === "assistant") {
+          copy[lastIdx] = { ...copy[lastIdx], ...updater(copy[lastIdx]) };
+        }
+        return copy;
+      });
+    },
+    []
+  );
+
+  async function handleSend() {
+    if (!input.trim() || isSending) return;
+
+    const userText = input.trim();
+    const nextUserMessage: ChatMessage = { role: "user", content: userText };
     const nextHistory = [...messages, nextUserMessage];
     setMessages(nextHistory);
     setInput("");
+    setIsSending(true);
+
+    // 先插入一条空的助手消息占位，后续通过 updateLastAssistant 增量填充
+    setMessages((current) => [
+      ...current,
+      {
+        role: "assistant",
+        content: "",
+        thinking: "",
+        toolCallsInfo: undefined,
+        toolStatuses: {},
+        streamPhase: "planning",
+      }
+    ]);
+
+    const callbacks: ChatStreamCallbacks = {
+      onStage(phase) {
+        updateLastAssistant(() => ({ streamPhase: phase as ChatMessage["streamPhase"] }));
+      },
+
+      onThinking(text) {
+        updateLastAssistant((prev) => ({
+          thinking: (prev.thinking ?? "") + text,
+        }));
+      },
+
+      onToolCalls(tools) {
+        updateLastAssistant(() => ({
+          toolCallsInfo: tools,
+          toolStatuses: Object.fromEntries(tools.map((t) => [t.name, "running" as const])),
+        }));
+      },
+
+      onToolStatus(name, status) {
+        updateLastAssistant((prev) => ({
+          toolStatuses: {
+            ...prev.toolStatuses,
+            [name]: status as "running" | "done" | "error",
+          },
+        }));
+      },
+
+      onReply(text) {
+        updateLastAssistant(() => ({ content: text }));
+      },
+
+      onCards(cards, action) {
+        updateLastAssistant(() => ({
+          cards,
+          action: action as ChatMessage["action"],
+        }));
+      },
+
+      onDone() {
+        updateLastAssistant(() => ({ streamPhase: "done" }));
+        setIsSending(false);
+      },
+
+      onError(errorMessage) {
+        updateLastAssistant((prev) => ({
+          content: prev.content || errorMessage,
+          streamPhase: "done",
+        }));
+        setIsSending(false);
+      },
+    };
 
     try {
-      setIsSending(true);
-      const response = await api.chat(nextUserMessage.content, nextHistory);
-      setMessages((current) => [
-        ...current,
-        {
-          role: "assistant",
-          content: response.reply,
-          cards: response.cards,
-          action: response.action
-        }
-      ]);
+      await api.chatStream(userText, nextHistory, callbacks);
     } catch (error) {
-      setMessages((current) => [
-        ...current,
-        {
-          role: "assistant",
-          content: error instanceof Error ? error.message : "聊天请求失败"
-        }
-      ]);
-    } finally {
+      updateLastAssistant(() => ({
+        content: error instanceof Error ? error.message : "聊天请求失败",
+        streamPhase: "done",
+      }));
       setIsSending(false);
     }
   }
+
+  /** 判断一条消息是否仍在流式接收中 */
+  const isStreaming = (msg: ChatMessage) =>
+    msg.role === "assistant" && msg.streamPhase && msg.streamPhase !== "done";
 
   return (
     <section className="grid lg:grid-cols-[0.95fr_1.05fr] gap-6 items-start">
@@ -89,14 +210,62 @@ export function ChatView({ onAccepted }: ChatViewProps) {
                   : "bg-[rgba(44,36,29,0.95)] text-white ml-auto max-w-[85%]"
               }`}
             >
-              <p className="text-sm leading-7">{message.content}</p>
+              {/* ── 助手消息：思考过程（流式时展开，完成后折叠） ── */}
+              {message.role === "assistant" && message.thinking && (
+                <Collapsible
+                  title={
+                    <span className="flex items-center gap-1">
+                      💭 思考过程
+                      {isStreaming(message) && <Loader2 className="w-3 h-3 animate-spin" />}
+                    </span>
+                  }
+                  defaultOpen={isStreaming(message)}
+                >
+                  <pre className="text-xs leading-5 whitespace-pre-wrap break-words text-[color:var(--muted)] bg-[rgba(157,111,61,0.06)] rounded-xl p-3 max-h-60 overflow-y-auto thin-scrollbar">
+                    {message.thinking}
+                  </pre>
+                </Collapsible>
+              )}
+
+              {/* ── 助手消息：工具调用标签（含执行状态） ── */}
+              {message.role === "assistant" && message.toolCallsInfo && message.toolCallsInfo.length > 0 && (
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {message.toolCallsInfo.map((tool, toolIndex) => {
+                    const status = message.toolStatuses?.[tool.name];
+                    const icon = status ? (TOOL_STATUS_ICON[status] ?? "🔧") : "🔧";
+                    return (
+                      <span
+                        key={`tool-${toolIndex}`}
+                        className="inline-flex items-center gap-1 text-xs bg-[rgba(157,111,61,0.12)] text-[color:var(--ink)] rounded-full px-2.5 py-0.5"
+                      >
+                        {icon} {tool.name}
+                        {tool.arguments && Object.keys(tool.arguments).length > 0 && (
+                          <span className="text-[color:var(--muted)]">
+                            ({Object.entries(tool.arguments).map(([k, v]) => `${k}=${v}`).join(", ")})
+                          </span>
+                        )}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {/* ── 流式阶段指示器 ── */}
+              {isStreaming(message) && !message.content && (
+                <div className="inline-flex items-center gap-2 text-sm text-[color:var(--muted)]">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  {PHASE_LABELS[message.streamPhase ?? ""] ?? "处理中..."}
+                </div>
+              )}
+
+              {/* ── 回复正文 ── */}
+              {message.content && (
+                <p className="text-sm leading-7">{message.content}</p>
+              )}
             </div>
           ))}
-          {isSending && (
-            <div className="rounded-[1.5rem] p-4 bg-[rgba(157,111,61,0.08)] text-[color:var(--ink)] inline-flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin" /> 正在思考...
-            </div>
-          )}
+          {/* 自动滚动锚点 */}
+          <div ref={chatEndRef} />
         </div>
         <div className="p-5 border-t border-[color:var(--line)]">
           <div className="flex gap-3">

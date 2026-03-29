@@ -40,6 +40,10 @@ class ChatResponseData(BaseModel):
     reply: str
     cards: list[dict[str, Any]] = Field(default_factory=list)
     action: Literal["query", "recommend", "clarify", "confirm"]
+    # DeepSeek-R1 思维链（规划 + 总结两阶段拼接），前端展示"思考过程"用
+    thinking: str | None = None
+    # 本次对话调用了哪些工具及参数摘要，前端展示"工具调用"标签用
+    tool_calls_info: list[dict[str, Any]] | None = None
 
 
 class UploadResponseData(BaseModel):
