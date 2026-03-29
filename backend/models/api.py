@@ -32,6 +32,10 @@ class ChatRequest(BaseModel):
 
     message: str
     history: list[ChatMessageDTO] = Field(default_factory=list)
+    # 用户在对话中粘贴/上传的图片（纯 base64 编码，不含 data: 前缀）
+    image_base64: str | None = None
+    # 图片 MIME 类型，如 "image/jpeg"
+    image_mime_type: str | None = None
 
 
 class ChatResponseData(BaseModel):

@@ -160,14 +160,18 @@ export const api = {
   async chatStream(
     message: string,
     history: ChatMessage[],
-    callbacks: ChatStreamCallbacks
+    callbacks: ChatStreamCallbacks,
+    imageBase64?: string,
+    imageMimeType?: string,
   ): Promise<void> {
     const response = await fetch(`${API_BASE}/api/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         message,
-        history: history.map(({ role, content }) => ({ role, content }))
+        history: history.map(({ role, content }) => ({ role, content })),
+        image_base64: imageBase64 ?? null,
+        image_mime_type: imageMimeType ?? null,
       })
     });
 
@@ -240,6 +244,9 @@ export const api = {
         break;
       case "error":
         cb.onError?.(data.message as string);
+        break;
+      case "image_analyzed":
+        cb.onImageAnalyzed?.(data.image_url as string, data.summary as string);
         break;
     }
   },

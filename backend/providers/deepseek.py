@@ -316,8 +316,13 @@ class DeepSeekProvider:
         chat_history: list[dict[str, str]],
         tool_schemas: list[dict[str, Any]],
         context_snapshot: dict[str, Any],
+        image_context: str | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式规划：逐块推送思维链，最终 yield 解析出的 plan。
+
+        Args:
+            image_context: 如果用户在对话中发送了图片，这里包含图片识别结果描述。
+                           Agent 会据此 + 用户文字来决定是添加衣物还是查询类似衣物。
 
         Yields:
             - {type: "reasoning", text: "..."}   → 思维链 chunk
@@ -338,6 +343,22 @@ class DeepSeekProvider:
             "\n" + build_taxonomy_description() + "\n"
             "如果用户询问的分类没有精确对应的衣物，应该查询最接近的大类或返回全部衣物供用户选择，"
             "而不是直接回答没有。\n"
+        )
+
+        # 如果用户发送了图片，追加图片相关指引
+        if image_context:
+            system_prompt += (
+                "\n\n【图片模式】用户发送了一张衣物图片。\n"
+                f"{image_context}\n"
+                "根据用户文字判断意图：\n"
+                "- 如果用户想把这件衣物添加到衣柜（如'添加''入库''加到衣柜'或只发图没说话），"
+                "就调用 wardrobe_add_from_image 工具，action=confirm。\n"
+                "- 如果用户想查询衣柜里有没有类似的衣物（如'我有这种吗''有没有类似的'），"
+                "就从识图结果中提取 category/color/style 等关键属性，调用 wardrobe_query，action=query。\n"
+                "- 如果用户只发了图片没有说任何文字，默认当作'把这件衣物添加到衣柜'处理。\n"
+            )
+
+        system_prompt += (
             f"可用工具 schema：{json.dumps(tool_schemas, ensure_ascii=False)}。"
             f"当前上下文摘要：{json.dumps(context_snapshot, ensure_ascii=False)}。"
         )

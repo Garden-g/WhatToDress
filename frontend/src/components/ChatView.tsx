@@ -1,7 +1,7 @@
-import { ChevronDown, ChevronRight, Loader2, SendHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, ImagePlus, Loader2, SendHorizontal, X } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
-import { api } from "../api/client";
+import { api, resolveAssetUrl } from "../api/client";
 import type { ChatMessage, ChatStreamCallbacks, OutfitRecommendation, WardrobeItem, WeatherSnapshot } from "../types";
 import { ItemCard } from "./ItemCard";
 
@@ -34,6 +34,7 @@ function Collapsible({ title, children, defaultOpen = false }: {
 
 /** 阶段描述映射 */
 const PHASE_LABELS: Record<string, string> = {
+  analyzing_image: "正在识别图片...",
   planning: "正在思考...",
   executing: "正在查询...",
   summarizing: "正在整理...",
@@ -45,6 +46,20 @@ const TOOL_STATUS_ICON: Record<string, string> = {
   done: "✅",
   error: "❌",
 };
+
+/** 把 File 转为纯 base64 字符串（不含 data: 前缀） */
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result as string;
+      // "data:image/jpeg;base64,/9j/..." → 取逗号后面的部分
+      resolve(dataUrl.split(",")[1]);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
 
 interface ChatViewProps {
   onAccepted: (outfit: OutfitRecommendation, weather: WeatherSnapshot | null, scenario: string) => Promise<void>;
@@ -72,11 +87,16 @@ export function ChatView({ onAccepted }: ChatViewProps) {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
-      content: "你可以直接问我：我有什么蓝色衬衫？或者 明天 18 度通勤穿什么？"
+      content: "你可以直接问我：我有什么蓝色衬衫？或者 明天 18 度通勤穿什么？\n也可以粘贴或上传衣物图片来添加衣服、查找类似衣服。"
     }
   ]);
   const [input, setInput] = useState("");
   const [isSending, setIsSending] = useState(false);
+
+  // 图片相关状态
+  const [selectedImage, setSelectedImage] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 用于自动滚动到底部
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -84,6 +104,36 @@ export function ChatView({ onAccepted }: ChatViewProps) {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isSending]);
+
+  /** 选中图片后生成预览 */
+  const handleImageSelect = useCallback((file: File) => {
+    if (!file.type.startsWith("image/")) return;
+    setSelectedImage(file);
+    const url = URL.createObjectURL(file);
+    setImagePreview(url);
+  }, []);
+
+  /** 清除已选图片 */
+  const clearImage = useCallback(() => {
+    setSelectedImage(null);
+    if (imagePreview) URL.revokeObjectURL(imagePreview);
+    setImagePreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }, [imagePreview]);
+
+  /** 处理粘贴事件 —— 检测剪贴板中的图片 */
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of items) {
+      if (item.type.startsWith("image/")) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) handleImageSelect(file);
+        return;
+      }
+    }
+  }, [handleImageSelect]);
 
   /**
    * 更新「最后一条助手消息」的某些字段。
@@ -104,13 +154,24 @@ export function ChatView({ onAccepted }: ChatViewProps) {
   );
 
   async function handleSend() {
-    if (!input.trim() || isSending) return;
+    const hasText = input.trim().length > 0;
+    const hasImage = selectedImage !== null;
+    if ((!hasText && !hasImage) || isSending) return;
 
-    const userText = input.trim();
-    const nextUserMessage: ChatMessage = { role: "user", content: userText };
+    const userText = input.trim() || (hasImage ? "添加这件衣服到我的衣柜" : "");
+    const userImagePreview = imagePreview; // 保存当前预览 URL
+    const imageFile = selectedImage;
+
+    // 构建用户消息（含图片预览）
+    const nextUserMessage: ChatMessage = {
+      role: "user",
+      content: userText,
+      imageUrl: userImagePreview ?? undefined,
+    };
     const nextHistory = [...messages, nextUserMessage];
     setMessages(nextHistory);
     setInput("");
+    clearImage();
     setIsSending(true);
 
     // 先插入一条空的助手消息占位，后续通过 updateLastAssistant 增量填充
@@ -122,9 +183,21 @@ export function ChatView({ onAccepted }: ChatViewProps) {
         thinking: "",
         toolCallsInfo: undefined,
         toolStatuses: {},
-        streamPhase: "planning",
+        streamPhase: hasImage ? "analyzing_image" : "planning",
       }
     ]);
+
+    // 如果有图片，转为 base64
+    let imageBase64: string | undefined;
+    let imageMimeType: string | undefined;
+    if (imageFile) {
+      try {
+        imageBase64 = await fileToBase64(imageFile);
+        imageMimeType = imageFile.type || "image/jpeg";
+      } catch {
+        imageBase64 = undefined;
+      }
+    }
 
     const callbacks: ChatStreamCallbacks = {
       onStage(phase) {
@@ -135,6 +208,10 @@ export function ChatView({ onAccepted }: ChatViewProps) {
         updateLastAssistant((prev) => ({
           thinking: (prev.thinking ?? "") + text,
         }));
+      },
+
+      onImageAnalyzed(_imageUrl, _summary) {
+        // 图片识别完成，靠 stage 切换显示状态即可
       },
 
       onToolCalls(tools) {
@@ -179,7 +256,7 @@ export function ChatView({ onAccepted }: ChatViewProps) {
     };
 
     try {
-      await api.chatStream(userText, nextHistory, callbacks);
+      await api.chatStream(userText, nextHistory, callbacks, imageBase64, imageMimeType);
     } catch (error) {
       updateLastAssistant(() => ({
         content: error instanceof Error ? error.message : "聊天请求失败",
@@ -210,6 +287,15 @@ export function ChatView({ onAccepted }: ChatViewProps) {
                   : "bg-[rgba(44,36,29,0.95)] text-white ml-auto max-w-[85%]"
               }`}
             >
+              {/* ── 用户消息：附带的图片 ── */}
+              {message.role === "user" && message.imageUrl && (
+                <img
+                  src={message.imageUrl}
+                  alt="用户上传的图片"
+                  className="max-w-[200px] max-h-[200px] rounded-xl mb-2 object-cover"
+                />
+              )}
+
               {/* ── 助手消息：思考过程（流式时展开，完成后折叠） ── */}
               {message.role === "assistant" && message.thinking && (
                 <Collapsible
@@ -268,7 +354,50 @@ export function ChatView({ onAccepted }: ChatViewProps) {
           <div ref={chatEndRef} />
         </div>
         <div className="p-5 border-t border-[color:var(--line)]">
+          {/* ── 图片预览条 ── */}
+          {imagePreview && (
+            <div className="flex items-center gap-2 mb-3 p-2 bg-[rgba(157,111,61,0.06)] rounded-xl">
+              <img
+                src={imagePreview}
+                alt="待发送图片"
+                className="w-16 h-16 rounded-lg object-cover"
+              />
+              <span className="text-xs text-[color:var(--muted)] flex-1 truncate">
+                {selectedImage?.name ?? "粘贴的图片"}
+              </span>
+              <button
+                onClick={clearImage}
+                className="p-1 rounded-full hover:bg-[rgba(0,0,0,0.08)] transition-colors"
+                title="移除图片"
+              >
+                <X className="w-4 h-4 text-[color:var(--muted)]" />
+              </button>
+            </div>
+          )}
+
+          {/* ── 隐藏的文件选择器 ── */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleImageSelect(file);
+              e.target.value = "";
+            }}
+          />
+
           <div className="flex gap-3">
+            {/* 上传图片按钮 */}
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="w-12 h-12 rounded-2xl border border-[color:var(--line)] bg-[rgba(244,238,228,0.7)] inline-flex items-center justify-center hover:bg-[rgba(157,111,61,0.12)] transition-colors"
+              title="上传图片"
+            >
+              <ImagePlus className="w-5 h-5 text-[color:var(--muted)]" />
+            </button>
+
             <input
               value={input}
               onChange={(event) => setInput(event.target.value)}
@@ -277,12 +406,14 @@ export function ChatView({ onAccepted }: ChatViewProps) {
                   void handleSend();
                 }
               }}
-              placeholder="例如：我有什么蓝色衬衫"
+              onPaste={handlePaste}
+              placeholder={imagePreview ? "描述一下（可选），例如：我有这种类型的衣服吗？" : "例如：我有什么蓝色衬衫"}
               className="flex-1 rounded-2xl border border-[color:var(--line)] px-4 py-3 bg-[rgba(244,238,228,0.7)]"
             />
             <button
               onClick={() => void handleSend()}
-              className="w-12 h-12 rounded-2xl bg-[color:rgba(44,36,29,0.95)] text-white inline-flex items-center justify-center"
+              disabled={isSending || (!input.trim() && !selectedImage)}
+              className="w-12 h-12 rounded-2xl bg-[color:rgba(44,36,29,0.95)] text-white inline-flex items-center justify-center disabled:opacity-40"
             >
               <SendHorizontal className="w-4 h-4" />
             </button>

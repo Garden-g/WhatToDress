@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -437,13 +438,80 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         """
 
         async def event_generator():
-            """SSE 事件生成器，手动编排对话全流程。"""
+            """SSE 事件生成器，手动编排对话全流程。
+
+            当用户携带图片时，先进行图片识别，再把识图结果注入规划上下文，
+            同时动态注册 wardrobe_add_from_image 工具让 Agent 可以把图中衣物入库。
+            """
 
             def sse(event_type: str, data: Any) -> str:
                 """格式化一条 SSE 事件。"""
                 return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
             try:
+                # ── 可选阶段 0：图片识别 ──
+                image_context: str | None = None
+                local_tool_schemas = list(context.tool_schemas)
+                local_tool_registry = dict(context.tool_registry)
+
+                if payload.image_base64:
+                    yield sse("stage", {"phase": "analyzing_image"})
+
+                    image_bytes = base64.b64decode(payload.image_base64)
+                    mime_type = payload.image_mime_type or "image/jpeg"
+
+                    # 保存原图
+                    file_name, original_path = context.image_store.save_original_bytes(image_bytes, mime_type)
+                    original_url = context.image_store.build_api_url("original", file_name)
+
+                    # 视觉识别
+                    analysis_raw = context.image_service.image_analyze(
+                        original_path, provider_name="gemini", mime_type=mime_type,
+                    )
+                    # 构建草稿（内部做归一化）以拿到结构化属性
+                    draft = context.image_service.build_draft_item(
+                        analysis=analysis_raw, original_image_url=original_url, white_bg_url=None,
+                    )
+
+                    # 推送图片已识别事件
+                    yield sse("image_analyzed", {
+                        "image_url": original_url,
+                        "summary": f"{draft.category} - {draft.subcategory or draft.name}，{draft.color}",
+                    })
+
+                    # 构建图片上下文给 DeepSeek 规划使用
+                    image_context = (
+                        f"【用户发送的图片识别结果】\n"
+                        f"名称：{draft.name}，类别：{draft.category}，子类：{draft.subcategory}，"
+                        f"挂放区：{draft.closet_section}，颜色：{draft.color}，"
+                        f"季节：{', '.join(draft.season_tags)}，风格：{', '.join(draft.style_tags)}，"
+                        f"正式度：{draft.formality}，材质：{draft.material or '未知'}"
+                    )
+
+                    # 动态注册「从图片添加衣物」工具 —— 闭包捕获 draft / original_path / mime_type
+                    def wardrobe_add_from_image() -> dict[str, Any]:
+                        """把用户发送的图片作为新衣物添加到衣柜。"""
+                        white_bg_url, white_bg_note = context.image_service.bg_remove(
+                            original_path, draft.item_id, mime_type,
+                        )
+                        draft.image_white_bg_url = white_bg_url
+                        draft.confirmed = True
+                        draft.analysis_notes = (
+                            f"chat_upload | {draft.analysis_notes or ''} | {white_bg_note or ''}"
+                        ).strip(" |")
+                        context.wardrobe_service.add_item(draft)
+                        return {
+                            "cards": [draft.model_dump(mode="json")],
+                            "added_item_name": draft.name,
+                        }
+
+                    local_tool_schemas.append({
+                        "name": "wardrobe_add_from_image",
+                        "description": "把用户在对话中发送的图片添加为衣柜中的新衣物（已自动识别属性）",
+                        "arguments": [],
+                    })
+                    local_tool_registry["wardrobe_add_from_image"] = wardrobe_add_from_image
+
                 # ── 阶段 1：规划（流式推送思维链） ──
                 yield sse("stage", {"phase": "planning"})
 
@@ -451,8 +519,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 async for event in context.deepseek_provider.async_stream_plan(
                     user_message=payload.message,
                     chat_history=[msg.model_dump(mode="json") for msg in payload.history],
-                    tool_schemas=context.tool_schemas,
+                    tool_schemas=local_tool_schemas,
                     context_snapshot=context._build_context_snapshot(),
+                    image_context=image_context,
                 ):
                     if event["type"] == "reasoning":
                         yield sse("thinking", {"text": event["text"], "phase": "planning"})
@@ -482,7 +551,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for tc in tool_calls:
                     name = tc.get("name", "")
                     arguments = tc.get("arguments") or {}
-                    tool_fn = context.tool_registry.get(name)
+                    tool_fn = local_tool_registry.get(name)
 
                     yield sse("tool_status", {"name": name, "status": "running"})
 

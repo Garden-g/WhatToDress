@@ -97,11 +97,13 @@ export interface ChatMessage {
   /** 工具执行状态（流式更新） */
   toolStatuses?: Record<string, "running" | "done" | "error">;
   /** 当前流式阶段 */
-  streamPhase?: "planning" | "executing" | "summarizing" | "done";
+  streamPhase?: "planning" | "executing" | "summarizing" | "analyzing_image" | "done";
+  /** 用户发送的图片 URL（用于在聊天气泡中展示） */
+  imageUrl?: string;
 }
 
 /** SSE 事件类型定义（后端推送的 event type） */
-export type SSEEventType = "stage" | "thinking" | "tool_calls" | "tool_status" | "reply" | "cards" | "done" | "error";
+export type SSEEventType = "stage" | "thinking" | "tool_calls" | "tool_status" | "reply" | "cards" | "done" | "error" | "image_analyzed";
 
 /** SSE 事件回调接口 */
 export interface ChatStreamCallbacks {
@@ -113,6 +115,8 @@ export interface ChatStreamCallbacks {
   onCards?: (cards: Array<Record<string, unknown>>, action: string) => void;
   onDone?: () => void;
   onError?: (message: string) => void;
+  /** 图片识别完成回调 */
+  onImageAnalyzed?: (imageUrl: string, summary: string) => void;
 }
 
 export interface ChatResponseData {
